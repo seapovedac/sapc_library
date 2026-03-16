@@ -1,2 +1,2 @@
-# sapc
-SAPC (Simulation and Analysis of Physical Chemistry) Library is a toolkit and knowledge base for molecular dynamics, modelling, and computational physical chemistry. It provides analysis tools, protocols, tutorials, theoretical notes, and practical guidance for scientific software and reproducible workflows.
+# SAPC (Simulation and Analysis of Physical Chemistry)
+This library is a comprehensive collection of tools and resources for modelling, simulation, and analysis in physical chemistry, molecular dynamics, and computational molecular science. It includes practical utilities for MD analysis, structural modelling, theoretical background, step-by-step protocols, tutorials, and curated package usage guides. SAPC is designed as an extensible framework to support research, method development, learning, and reproducible computational workflows.
