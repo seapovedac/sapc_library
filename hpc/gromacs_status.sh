@@ -558,7 +558,23 @@ classify_sim() {
     xtc=$(     find_sim_xtc "$dir")
     cpt=$(     find_by_ext  "$dir" "cpt")
     edr=$(     find_by_ext  "$dir" "edr")
-    confout=$( find "$dir" -maxdepth 1 -name "confout.gro" 2>/dev/null | head -1)
+    # Final coordinate file — search in priority order:
+    #   1. confout.gro          (GROMACS default output name)
+    #   2. ${SIM_PATTERN}.gro   (when mdrun -c is set to the pattern)
+    #   3. ${SIM_PATTERN}*.gro  (any variant suffix, e.g. _final.gro)
+    #   4. any *.gro newer than the .tpr (produced by this run, not input)
+    confout=""
+    confout=$(find "$dir" -maxdepth 1 -name "confout.gro" 2>/dev/null | head -1)
+    if [[ -z "$confout" && -n "$SIM_PATTERN" ]]; then
+        confout=$(find "$dir" -maxdepth 1 -name "${SIM_PATTERN}.gro" 2>/dev/null | head -1)
+    fi
+    if [[ -z "$confout" && -n "$SIM_PATTERN" ]]; then
+        confout=$(find "$dir" -maxdepth 1 -name "${SIM_PATTERN}*.gro" 2>/dev/null | head -1)
+    fi
+    if [[ -z "$confout" && -n "$tpr" ]]; then
+        # Last resort: any .gro file newer than the .tpr (output, not input)
+        confout=$(find "$dir" -maxdepth 1 -name "*.gro" -newer "$tpr" 2>/dev/null | head -1)
+    fi
     err_file=$(latest_slurm_file "$dir" "err")
     out_file=$(latest_slurm_file "$dir" "out")
 
@@ -573,6 +589,7 @@ classify_sim() {
     local status="UNKNOWN"
     local gmx_lines="" mpi_lines="" gen_err="-" progress="-" perf_enc="-"
     local steps="-" time_ps="-" job_id="-" atoms="-" disk="-"
+    local fin_log=0  # set early — used both in FINISHED and FINALIZED checks
 
     [[ -n "$err_file" ]] && job_id="$(job_id_from_file "$err_file")"
     [[ -n "$mdlog"    ]] && time_ps="$(parse_last_time_ps "$mdlog")"
@@ -587,6 +604,11 @@ classify_sim() {
     fi
     [[ -n "$mdlog"    ]] && atoms="$(parse_atoms "$mdlog")"
     [[ $SHOW_DISK -eq 1 ]] && disk="$(dir_disk_usage "$dir")"
+    # Detect clean mdrun finish early — used by both FINISHED and FINALIZED
+    [[ -n "$mdlog" ]] && grep -q "Finished mdrun" "$mdlog" 2>/dev/null && fin_log=1
+    # If mdrun finished cleanly it always wrote a final structure — mark gro:●
+    # even if we could not determine the exact filename from disk.
+    [[ $fin_log -eq 1 ]] && has_confout=1
 
     # SLURM .out
     if [[ $READ_SLURM_OUT -eq 1 && -n "$out_file" && -s "$out_file" ]]; then
@@ -644,23 +666,23 @@ classify_sim() {
         [[ "$gen_err" != "-" ]] && any_error=1
     fi
     rm -f "$gen_err_file"
-    [[ $any_error -eq 1 ]] && status="FAILED"
+    if [[ $any_error -eq 1 ]]; then
+        # If the MD simulation itself finished cleanly ("Finished mdrun" in log)
+        # but only post-processing/script errors were found (no GROMACS fatal
+        # block, no MPI abort) → the run is FINALIZED, not FAILED.
+        if [[ $fin_log -eq 1 && -z "$gmx_lines" && -z "$mpi_lines" ]]; then
+            status="FINALIZED"
+        else
+            status="FAILED"
+        fi
+    fi
 
-    # Clean finish — requires BOTH:
-    #   1. "Finished mdrun" present in the GROMACS log (not any .log)
-    #   2. confout.gro exists  (final coordinate file written by mdrun)
-    # A directory with only a log file (e.g. the status log dir) will never qualify.
-    if [[ "$status" != "FAILED" ]]; then
-        local fin_log=0
-        # Only check the pattern-specific log, not just any .log
-        if [[ -n "$mdlog" ]]; then
-            grep -q "Finished mdrun" "$mdlog" 2>/dev/null && fin_log=1
-        fi
-        # Require both the finish marker AND the output coordinate file
-        if [[ $fin_log -eq 1 && -n "$confout" ]]; then
-            status="FINISHED"
-            perf_enc="$(parse_performance "$mdlog")"
-        fi
+    # Clean finish — "Finished mdrun" in the GROMACS log is the primary signal.
+    # confout.gro (or pattern.gro) is checked for the files column display only;
+    # its absence does not prevent FINISHED (it may have been moved or renamed).
+    if [[ "$status" != "FAILED" && "$status" != "FINALIZED" && $fin_log -eq 1 ]]; then
+        status="FINISHED"
+        [[ -n "$mdlog" ]] && perf_enc="$(parse_performance "$mdlog")"
     fi
 
     # ── File-based fallback status ───────────────────────────────────────────
@@ -735,6 +757,7 @@ files_column() {
 status_label() {
     case "$1" in
         FINISHED)    printf "${GREEN}FINISHED   ✔${RESET}"  ;;
+        FINALIZED)   printf "${GREEN}FINALIZED  ✔${RESET}"  ;;
         RUNNING)     printf "${CYAN}RUNNING    ▶${RESET}"   ;;
         FAILED)      printf "${RED}FAILED     ✖${RESET}"    ;;
         INCOMPLETE)  printf "${YELLOW}INCOMPLETE ⚠${RESET}" ;;
@@ -835,7 +858,7 @@ printf "${BOLD}  %-${CW_PATH}s  %-${CW_STAT}s  %-${CW_JOB}s  %-${CW_TIME}s  %-${
 SEP="  $(printf '%.0s─' $(seq 1 $CW_PATH))  $(printf '%.0s─' $(seq 1 $CW_STAT))  $(printf '%.0s─' $(seq 1 $CW_JOB))  $(printf '%.0s─' $(seq 1 $CW_TIME))  $(printf '%.0s─' $(seq 1 $CW_FRM))  $(printf '%.0s─' $(seq 1 $CW_DSK))  $(printf '%.0s─' $(seq 1 $CW_ATM))  $(printf '%.0s─' {1..36})"
 echo -e "${DIM}${SEP}${RESET}"
 
-declare -i total=0 n_fin=0 n_run=0 n_fail=0 n_inc=0 n_queued=0 n_other=0
+declare -i total=0 n_fin=0 n_finalized=0 n_run=0 n_fail=0 n_inc=0 n_queued=0 n_other=0
 declare -a FAILED_DETAILS=()
 
 for sim_dir in "${SIM_DIRS[@]}"; do
@@ -851,15 +874,16 @@ for sim_dir in "${SIM_DIRS[@]}"; do
 
     total+=1
     case "$status" in
-        FINISHED)    n_fin+=1    ;;
-        RUNNING)     n_run+=1    ;;
-        FAILED)      n_fail+=1   ;;
-        INCOMPLETE)  n_inc+=1    ;;
-        QUEUED)      n_queued+=1 ;;
-        *)           n_other+=1  ;;
+        FINISHED)    n_fin+=1       ;;
+        FINALIZED)   n_finalized+=1 ;;
+        RUNNING)     n_run+=1       ;;
+        FAILED)      n_fail+=1      ;;
+        INCOMPLETE)  n_inc+=1       ;;
+        QUEUED)      n_queued+=1    ;;
+        *)           n_other+=1     ;;
     esac
 
-    [[ $ERRORS_ONLY -eq 1 && "$status" != "FAILED" && "$status" != "INCOMPLETE" && "$status" != "QUEUED" ]] && continue
+    [[ $ERRORS_ONLY -eq 1 && "$status" != "FAILED" && "$status" != "FINALIZED" && "$status" != "INCOMPLETE" && "$status" != "QUEUED" ]] && continue
 
     disp_rel="$rel"
     (( ${#disp_rel} > CW_PATH )) && disp_rel="...${disp_rel: -$((CW_PATH-3))}"
@@ -881,12 +905,10 @@ for sim_dir in "${SIM_DIRS[@]}"; do
         "$job_id" "$sim_time" "$steps" "$disp_disk" "$disp_atoms"
     printf "%b\n" "$files_col"
 
-    # ── Sub-rows: errors ──────────────────────────────────────────────────────
+    # ── Sub-rows: errors (FAILED) ────────────────────────────────────────────
     if [[ "$status" == "FAILED" ]]; then
         print_block "$gmx_enc" "$RED"    "GROMACS" "├"
         print_block "$mpi_enc" "$ORANGE" "MPI/PAR" "├"
-        # OTHER: show only if not already captured in GROMACS or MPI blocks
-        # gen_err may be multi-line (^-encoded); check first line against gmx/mpi first lines
         if [[ "$gen_err" != "-" ]]; then
             gen_first="${gen_err%%^*}"
             gmx_first="${gmx_enc%%^*}"
@@ -895,6 +917,11 @@ for sim_dir in "${SIM_DIRS[@]}"; do
                 print_block "$gen_err" "$YELLOW" "OTHER  " "└"
             fi
         fi
+    fi
+
+    # ── Sub-rows: post-processing notes (FINALIZED) ───────────────────────────
+    if [[ "$status" == "FINALIZED" && "$gen_err" != "-" ]]; then
+        print_block "$gen_err" "$DIM" "NOTE   " "└"
     fi
 
     # ── Sub-rows: performance (FINISHED) ─────────────────────────────────────

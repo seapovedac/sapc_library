@@ -1,17 +1,20 @@
 # gromacs_status.sh
 
-A terminal-based status explorer for GROMACS molecular dynamics simulations managed with SLURM. It scans a directory tree, identifies all active simulation directories by their output files, queries `squeue` for live job state, parses GROMACS and MPI error blocks, and prints a colour-coded summary table.
+A terminal-based status explorer for GROMACS molecular dynamics simulations managed with SLURM. It scans a directory tree, identifies simulation directories by their output files, queries `squeue` for live job state, parses GROMACS and MPI error blocks, and prints a colour-coded aligned table.
 
 ---
 
 ## Features
 
-- **No directory name assumptions** — discovery is fingerprint-based (`.tpr`, `.cpt`, `.edr`, `.xtc`, `.log`). Works with any folder layout.
-- **SLURM-authoritative status** — calls `squeue` once at startup. Running and pending (queued) jobs override file-based heuristics.
-- **Name-based job matching** — PD (pending) jobs that haven't created `.err` files yet are matched to their directory by extracting replica and system numbers from both the path and the job name.
-- **Three-layer error parsing** — GROMACS fatal block (from `.out`), MPI/prterun messages (from `.err`), and generic SLURM errors shown inline under each failed row.
-- **Timestep-aware time display** — step counts are multiplied by `dt` (configurable) and auto-scaled to ps / ns / µs.
-- **Log rotation** — always saves a timestamped log; keeps the 10 most recent automatically.
+- **Fingerprint-based discovery** — no directory name assumptions. Finds simulation dirs by presence of `.tpr`, `.cpt`, `.edr`, `.xtc`, `.log` files at any depth.
+- **SLURM-authoritative status** — calls `squeue` once at startup. Two matching strategies:
+  - *Exact*: job ID from `.err` file found in squeue (running/just-started jobs).
+  - *Name-based*: replica + system numbers extracted from the directory path and matched against squeue job names — catches **pending (PD) jobs** that have no `.err` file yet.
+- **FINALIZED vs FAILED** — if `"Finished mdrun"` is present in the log but only post-processing script errors occurred (`sed`, `sbatch`), the status is `FINALIZED` instead of `FAILED`. The post-processing notes appear as dim sub-rows.
+- **Three-layer inline error display** — GROMACS fatal block (`.out`), MPI/prterun messages (`.err`), and generic SLURM errors shown directly under each failed row.
+- **Timestep-aware time** — step counts × `dt` auto-scaled to ps / ns / µs.
+- **ANSI-aware column alignment** — all columns stay aligned even when coloured status strings contain invisible escape bytes.
+- **Log rotation** — saves a timestamped log every run; keeps the 10 most recent automatically. FAILED detail (full `.err` content) is written to the log only, not the terminal.
 
 ---
 
@@ -20,18 +23,17 @@ A terminal-based status explorer for GROMACS molecular dynamics simulations mana
 | Tool | Notes |
 |---|---|
 | `bash` ≥ 4.2 | Associative arrays required |
-| `gawk` / `awk` | Standard on all HPC systems |
+| `awk` | Standard on all HPC systems |
 | `grep` with `-P` | Perl-compatible regex (GNU grep) |
 | `squeue` | Optional — needed for live SLURM state |
 | `du` | Optional — needed for disk usage column |
-| `timeout` | Optional — protects `du` on slow filesystems |
+| `timeout` | Optional — protects `du` on slow network filesystems |
 
 ---
 
 ## Installation
 
 ```bash
-# Copy to your project directory or somewhere on your PATH
 cp gromacs_status.sh ~/bin/
 chmod +x ~/bin/gromacs_status.sh
 ```
@@ -41,14 +43,14 @@ chmod +x ~/bin/gromacs_status.sh
 ## Quick Start
 
 ```bash
-# Run from the directory that contains your simulation folders
+# Run from the directory containing your simulation folders
 ./gromacs_status.sh .
 
-# Or point to a specific root
+# Or point to a root directory
 ./gromacs_status.sh /scratch/user/project
 ```
 
-On the first run (without `-p`) the script will ask two interactive questions:
+On the first run (without `-p`) two interactive questions are asked:
 
 ```
 Step 1 — Output file pattern
@@ -63,7 +65,7 @@ Step 2 — SLURM log prefix
   SLURM prefix [Enter = keep 'MD_SIMULATION']:
 ```
 
-Selecting a pattern (e.g. `9.production`) tells the script to look for `9.production.log`, `9.production.xtc`, `9.production.cpt`, etc., so it reads the right files in every replica directory.
+The pattern (e.g. `9.production`) tells the script which files to read in each replica directory: `9.production.log`, `9.production.xtc`, `9.production.cpt`, etc.
 
 ---
 
@@ -73,25 +75,25 @@ Selecting a pattern (e.g. `9.production`) tells the script to look for `9.produc
 ./gromacs_status.sh [ROOT_DIR] [OPTIONS]
 ```
 
-### Options
+### All options
 
 | Flag | Default | Description |
 |---|---|---|
-| `-p, --pattern NAME` | _(interactive)_ | Base name of GROMACS output files, e.g. `9.production` |
+| `-p, --pattern NAME` | *(interactive)* | Base name of GROMACS output files, e.g. `9.production` |
 | `--slurm-prefix PFX` | `MD_SIMULATION` | Prefix of SLURM log files → `PFX.err.<jobid>` |
 | `-d, --depth N` | unlimited | Maximum directory search depth |
-| `-e, --errors-only` | off | Show only FAILED / INCOMPLETE / QUEUED rows |
+| `-e, --errors-only` | off | Show only FAILED / FINALIZED / INCOMPLETE / QUEUED rows |
 | `-v, --verbose` | off | Show file inventory below each row |
-| `-x, --exclude PATTERN` | _(none)_ | Skip directories whose path contains `PATTERN`. Repeatable. |
-| `--no-color` | off | Disable ANSI colours (good for piping or `grep`) |
+| `-x, --exclude PATTERN` | *(none)* | Skip dirs whose path contains `PATTERN`. Repeatable. |
+| `--no-color` | off | Disable ANSI colours (clean for piping / `grep`) |
 | `--no-gromacs-err` | on | Do not parse the GROMACS fatal error block |
 | `--no-mpi-err` | on | Do not parse MPI/prterun error lines |
 | `--no-slurm-out` | on | Do not read `.out` file for progress/error info |
-| `--no-disk` | on | Skip `du -sh` per directory (faster on slow filesystems) |
-| `--time-unit UNIT` | auto | Force time display unit: `ps`, `ns`, or `us` |
-| `--dt VAL` | `0.02` | Integration timestep in ps. Default = 20 fs (MARTINI CG). Use `0.002` for atomistic (2 fs). |
-| `--err-lines N` | `3` | Lines of inline error context per error type. `0` = label only. |
-| `-l, --log [DIR]` | `./md_status_logs` | Save output to a timestamped log file. Last 10 logs are kept. |
+| `--no-disk` | on | Skip `du -sh` (faster on slow filesystems) |
+| `--time-unit UNIT` | auto | Force time unit: `ps`, `ns`, or `us` |
+| `--dt VAL` | `0.02` | Integration timestep in ps. Default = 20 fs (MARTINI CG). Use `0.002` for atomistic 2 fs runs. |
+| `--err-lines N` | `3` | Inline error context lines per error type. `0` = label only. |
+| `-l, --log [DIR]` | `./md_status_logs` | Log directory. 10 most recent logs are kept. |
 | `-h, --help` | — | Print help and exit |
 
 ---
@@ -99,39 +101,36 @@ Selecting a pattern (e.g. `9.production`) tells the script to look for `9.produc
 ## Examples
 
 ```bash
-# Minimal — interactive prompts for pattern and SLURM prefix
+# Minimal — interactive prompts
 ./gromacs_status.sh .
 
-# Fully non-interactive — production run with all flags set
+# Fully non-interactive
 ./gromacs_status.sh /scratch/proj \
     -p 9.production \
     --slurm-prefix MD_SIMULATION \
     --dt 0.02 \
     --time-unit us
 
-# Show only problems (failed, incomplete, queued)
+# Show only problems
 ./gromacs_status.sh . -p 9.production -e
 
-# Atomistic run with 2 fs timestep, time in ns
+# Atomistic 2 fs timestep, time in ns
 ./gromacs_status.sh /scratch/atomistic -p md_production --dt 0.002 --time-unit ns
 
-# More error context (5 lines per error type)
+# More error context
 ./gromacs_status.sh . -p 9.production --err-lines 5
 
 # Skip disk usage (faster on Panasas / Lustre / GPFS)
 ./gromacs_status.sh . -p 9.production --no-disk
 
-# Exclude backup and test directories
-./gromacs_status.sh . -p 9.production -x backup -x test -x old
+# Exclude specific directories
+./gromacs_status.sh . -p 9.production -x backup -x test -x old_runs
 
-# Limit search depth to 4 levels
-./gromacs_status.sh /large/project -p 9.production -d 4
+# Custom SLURM log prefix
+./gromacs_status.sh . -p 9.production --slurm-prefix run
 
-# Save log to a custom directory, disable colour for grep
-./gromacs_status.sh . -p 9.production --no-color -l /home/user/sim_logs
-
-# Verbose file inventory + errors only
-./gromacs_status.sh . -p 9.production -e -v
+# Save log to a custom path, no colours
+./gromacs_status.sh . -p 9.production --no-color -l /home/user/logs
 ```
 
 ---
@@ -143,28 +142,32 @@ Selecting a pattern (e.g. `9.production`) tells the script to look for `9.produc
 | Column | Description |
 |---|---|
 | `PATH (relative)` | Directory path relative to the root |
-| `STATUS` | Simulation state (see below) |
-| `JOB ID` | SLURM job ID from the latest `.err` file or squeue |
+| `STATUS` | Simulation state — see table below |
+| `JOB ID` | SLURM job ID (with `(PD)` suffix for pending jobs) |
 | `SIM TIME` | Simulated time (steps × dt), auto-scaled |
-| `STEPS` | Last step number reached |
-| `DISK` | Directory size from `du -sh` |
-| `ATOMS` | Atom count parsed from the GROMACS log |
-| `FILES` | Presence of key output files (● = present, ○ = absent) |
+| `STEPS` | Last MD step number reached |
+| `DISK` | Directory size (`du -sh`) |
+| `ATOMS` | Atom count from the GROMACS log |
+| `FILES` | Key output files — `●` present, `○` absent |
 
 ### Status values
 
-| Status | Colour | Meaning |
+| Status | Colour | Condition |
 |---|---|---|
-| `FINISHED ✔` | Green | `confout.gro` present **and** `Finished mdrun` in log |
-| `RUNNING ▶` | Cyan | Job is `R` in `squeue`, or `.cpt` modified within the last 60 min |
-| `QUEUED ⏳` | Blue | Job is `PD` (pending) in `squeue` — matched by job name or `.err` file |
-| `INCOMPLETE ⚠` | Yellow | `.cpt` or `.edr` found but no clean finish and no error detected |
-| `FAILED ✖` | Red | Error pattern found in SLURM `.err` or `.out` files |
+| `FINISHED ✔` | Green | `"Finished mdrun"` in GROMACS log |
+| `FINALIZED ✔` | Green | `"Finished mdrun"` in log, but post-run script had errors (`sed`/`sbatch`) — MD itself completed |
+| `RUNNING ▶` | Cyan | Job is `R` in squeue, or `.cpt` modified within the last 60 min |
+| `QUEUED ⏳` | Blue | Job is `PD` (pending) in squeue |
+| `INCOMPLETE ⚠` | Yellow | `.cpt` or `.edr` found, no clean finish, no error |
+| `FAILED ✖` | Red | GROMACS fatal block or MPI abort found in SLURM logs |
 | `NOT_STARTED ○` | Dim | `.tpr` found but no output files yet |
-| `NO_TPR ✗` | Magenta | No `.tpr` found — may not be a simulation directory |
+| `NO_TPR ✗` | Magenta | No `.tpr` found |
 
-### Error sub-rows (under FAILED rows)
+> **FINALIZED vs FAILED**: if the simulation ran to completion (`"Finished mdrun"` in the log) but the post-processing step failed (missing script, empty `sbatch` job), the status is `FINALIZED` — not `FAILED`. Post-processing notes still appear as dim `NOTE` sub-rows for visibility.
 
+### Inline sub-rows
+
+**Under FAILED rows:**
 ```
   14.2/.../replica2  FAILED ✖   1624873   ...
     ├ GROMACS  File input/output error:
@@ -174,74 +177,92 @@ Selecting a pattern (e.g. `9.production`) tells the script to look for `9.produc
     └ OTHER    sbatch: error: Batch script is empty!
 ```
 
-| Label | Colour | Source |
-|---|---|---|
-| `GROMACS` | Red | The `-------` fatal error block in the GROMACS `.out` file |
-| `MPI/PAR` | Orange | `MPI_ABORT`, `prterun`, segfault, OOM from the `.err` file |
-| `OTHER` | Yellow | `sbatch` errors, missing files, I/O errors |
+**Under FINALIZED rows:**
+```
+  14.2/.../replica3  FINALIZED ✔   1625377   ...
+    └ NOTE   sed: can't read 1.post-process.sh: No such file or directory
+```
 
-### Performance sub-row (under FINISHED rows)
-
+**Under FINISHED rows (performance):**
 ```
   14.1/.../replica1  FINISHED ✔   ...
     └ PERF   ns/day: 2.345   hours/ns: 10.234   wall time: 34h12m07s
 ```
 
-### Progress sub-row (under RUNNING / INCOMPLETE rows)
-
+**Under RUNNING / INCOMPLETE rows (last progress line):**
 ```
   14.1/.../replica2  RUNNING ▶   ...
     └ PROGRS  imb F 18% step 137931100, will finish Wed Mar 18 14:26:06 2026
 ```
 
+| Sub-row | Colour | Source |
+|---|---|---|
+| `GROMACS` | Red | `-------` fatal block in GROMACS `.out` |
+| `MPI/PAR` | Orange | `MPI_ABORT`, `prterun`, segfault from `.err` |
+| `OTHER` | Yellow | `sbatch` errors, missing files, I/O |
+| `NOTE` | Dim | Post-processing errors on a completed simulation |
+| `PERF` | Green | Performance stats from GROMACS log (FINISHED only) |
+| `PROGRS` | Cyan | Last progress line from SLURM `.out` (RUNNING/INCOMPLETE) |
+
 ---
 
 ## Log Files
 
-Every run saves a timestamped log to `./md_status_logs/` (or the directory set with `-l`):
+Every run writes to `./md_status_logs/` (or the path set with `-l`):
 
 ```
 md_status_logs/
-  md_status_20260316_143201.log   ← terminal output (with ANSI stripped)
-  md_status_20260316_091045.log
+  md_status_20260320_143201.log   ← most recent
+  md_status_20260320_091045.log
   ...                             (10 most recent kept automatically)
 ```
 
-The log contains everything printed to the terminal **plus** a `FAILED SIMULATIONS — FULL DETAIL` section that is not shown on screen. This section includes the complete content of each SLURM `.err` file for every failed simulation.
+The log contains the full terminal output **plus** a `FAILED SIMULATIONS — FULL DETAIL` section not shown on screen, which includes the complete content of every SLURM `.err` file for failed simulations.
 
 ---
 
-## How SLURM State Is Determined
+## How SLURM State Works
 
-The script calls `squeue -u $USER` once at startup and builds an in-memory lookup table. For each simulation directory it tries two matching strategies in order:
+`squeue -u $USER` is called once at startup. For each simulation directory, two matching strategies are tried in order:
 
-1. **Exact match** — scans `.err` files in the directory, extracts their job IDs, and looks each one up in the squeue table. Works for jobs that are running or recently started.
+1. **Exact** — `.err` files in the directory are scanned; if any job ID appears in the squeue table, that job's state is used directly. Works for running and recently started jobs.
 
-2. **Name match** — for pending (`PD`) jobs that have not yet created a `.err` file, extracts the replica number and system number from the directory path and matches them against squeue job names. For example, directory `CCPG1-2SIGMAR1/replica3` will match a job named `r3_..._sigmar1-2_...`.
+2. **Name-based** — for pending jobs (PD) that have no `.err` file yet, the replica number and system-specific number are extracted from the directory path and matched against squeue job names:
+   - Replica from `replicaN` in the path → job name must start with `r{N}_`
+   - System number from the protein name pattern (e.g. `CCPG1-2SIGMAR` → `2`) → job name must contain `-2`
 
-If `squeue` is not available, the script falls back to file-based heuristics (checkpoint modification time, presence of output files).
+   Example: `14.2.oligomerization_CG_8CCPG1-2SIGMAR1/replica3` → matches `r3_ccpg1-idr-8_sigmar1-2_memb`.
+
+If `squeue` is unavailable, the script falls back entirely to file-based heuristics (checkpoint modification time, presence of output files).
 
 ---
 
-## Notes on Specific Setups
+## Notes
 
 ### MARTINI Coarse-Grained (default)
-The default `--dt 0.02` (20 fs) is correct for standard MARTINI runs with a 20 fs timestep.
+`--dt 0.02` (20 fs) is the default, matching standard MARTINI CG timesteps.
 
 ### Atomistic simulations
-Use `--dt 0.002` (2 fs) for standard atomistic AMBER/CHARMM/OPLS runs:
 ```bash
 ./gromacs_status.sh . -p md_production --dt 0.002 --time-unit ns
 ```
 
 ### Slow network filesystems (Panasas, Lustre, GPFS)
-The `du -sh` call is wrapped with `timeout 15`. If your filesystem is slow enough to cause timeouts (showing `?` in the DISK column), disable disk reporting entirely:
+`du -sh` uses `timeout 15` internally. If disk reporting is too slow (shows `?`), disable it:
 ```bash
 ./gromacs_status.sh . -p 9.production --no-disk
 ```
 
 ### Custom SLURM log naming
-If your cluster uses a different prefix (e.g. `run.err.1234567` instead of `MD_SIMULATION.err.1234567`):
+If your cluster names logs differently (e.g. `run.err.1234567`):
 ```bash
 ./gromacs_status.sh . -p 9.production --slurm-prefix run
 ```
+
+### Final structure file detection
+The script searches for the output `.gro` file in this order:
+1. `confout.gro` (GROMACS default)
+2. `${PATTERN}.gro` (e.g. `9.production.gro`)
+3. `${PATTERN}*.gro` (any suffix variant)
+4. Any `*.gro` newer than the `.tpr` (timestamp-based fallback)
+5. If `"Finished mdrun"` is in the log, `gro:●` is shown regardless — GROMACS always writes a final structure when it finishes cleanly.
