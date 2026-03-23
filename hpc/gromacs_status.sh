@@ -409,26 +409,61 @@ parse_atoms() {
 #           ns/day:  2.345
 #           hours/ns: 10.234
 parse_performance() {
+    # GROMACS 2021+ log performance block format:
+    #
+    #   Performance:   ns/day   hours/ns     ← header line
+    #                    2.348     10.221    ← data line (next line)
+    #
+    #          Core t (s)   Wall t (s)        (%)
+    #   Time:   983442.900    2458.700    400.0
+    #                              ↑ wall time in seconds (column 3)
     local f="$1"
-    local ns_day hours_ns wall_time
-    # ns/day  (also written as "ns/day:" or inside the performance block)
-    ns_day=$(grep -oP '(?i)ns/day[:\s]+\K[0-9]+\.?[0-9]*' "$f" 2>/dev/null | tail -1)
-    hours_ns=$(grep -oP '(?i)hour[s]?/ns[:\s]+\K[0-9]+\.?[0-9]*' "$f" 2>/dev/null | tail -1)
-    # Wall time in seconds → convert to h:m:s
-    wall_time=$(grep -oP '(?i)wall\s+time[^:]*:\s*\K[0-9]+\.?[0-9]*' "$f" 2>/dev/null | tail -1)
-    local wall_fmt="-"
+    local ns_day="" hours_ns="" wall_time="" wall_fmt="-"
+
+    # ns/day + hours/ns: GROMACS writes these in different layouts depending on version:
+    #   Layout A (2021+): "Performance:  ns/day  hours/ns" header, values on next line
+    #   Layout B (older): "Performance:" alone, then "ns/day  hours/ns" header, values on next line
+    #   Layout C (some):  "Performance:   4.155   5.775" values on same line
+    local perf_data
+    # Try layout A: header and values separated — grep header line, take next data line
+    perf_data=$(grep -A2 'Performance:' "$f" 2>/dev/null \
+        | grep -v 'Performance:' | grep -v '^--$' \
+        | grep -E '[0-9]+\.[0-9]+' | head -1)
+    if [[ -n "$perf_data" ]]; then
+        # The data line has two floats: ns/day and hours/ns
+        ns_day=$(echo   "$perf_data" | awk '{for(i=1;i<=NF;i++) if($i+0>0){print $i; exit}}')
+        hours_ns=$(echo "$perf_data" | awk '{found=0; for(i=1;i<=NF;i++) if($i+0>0){if(found){print $i; exit} found=1}}')
+        [[ "$ns_day"   =~ ^[0-9]+\.?[0-9]*$ ]] || ns_day=""
+        [[ "$hours_ns" =~ ^[0-9]+\.?[0-9]*$ ]] || hours_ns=""
+    fi
+    # Fallback: values on the same line as Performance:
+    if [[ -z "$ns_day" ]]; then
+        local perf_line
+        perf_line=$(grep 'Performance:' "$f" 2>/dev/null | grep -E '[0-9]+\.[0-9]+' | tail -1)
+        if [[ -n "$perf_line" ]]; then
+            ns_day=$(echo   "$perf_line" | grep -oP '[0-9]+\.[0-9]+' | head -1)
+            hours_ns=$(echo "$perf_line" | grep -oP '[0-9]+\.[0-9]+' | tail -1)
+            [[ "$ns_day" == "$hours_ns" ]] && hours_ns=""
+        fi
+    fi
+
+    # Wall time in seconds: "Time:  <core_t>  <wall_t>  <pct>" — column 3 is wall_t
+    wall_time=$(grep '^\s*Time:' "$f" 2>/dev/null | tail -1 | awk '{print $3}')
+    [[ "$wall_time" =~ ^[0-9]+\.?[0-9]*$ ]] || wall_time=""
+
     if [[ -n "$wall_time" && "$wall_time" != "0" ]]; then
         wall_fmt=$(awk -v s="$wall_time" 'BEGIN{
             h=int(s/3600); m=int((s%3600)/60); sec=int(s%60)
             printf "%02dh%02dm%02ds", h, m, sec
         }')
     fi
-    # Encode as ^-separated
+
+    # Build a single formatted line:  ns/day: 4.155   hours/ns: 5.775   wall time: 66h44m07s
     local out=""
-    [[ -n "$ns_day"   ]] && out+="ns/day: ${ns_day}^"
-    [[ -n "$hours_ns" ]] && out+="hours/ns: ${hours_ns}^"
-    [[ "$wall_fmt" != "-" ]] && out+="wall time: ${wall_fmt}^"
-    out="${out%^}"   # strip trailing ^
+    [[ -n "$ns_day"    ]] && out+="ns/day: ${ns_day}   "
+    [[ -n "$hours_ns"  ]] && out+="hours/ns: ${hours_ns}   "
+    [[ "$wall_fmt" != "-" ]] && out+="wall time: ${wall_fmt}"
+    out="${out%   }"   # strip trailing spaces
     echo "${out:--}"
 }
 
@@ -671,7 +706,8 @@ classify_sim() {
         # but only post-processing/script errors were found (no GROMACS fatal
         # block, no MPI abort) → the run is FINALIZED, not FAILED.
         if [[ $fin_log -eq 1 && -z "$gmx_lines" && -z "$mpi_lines" ]]; then
-            status="FINALIZED"
+            status="FINISHED"
+            [[ -n "$mdlog" ]] && perf_enc="$(parse_performance "$mdlog")"
         else
             status="FAILED"
         fi
@@ -680,7 +716,7 @@ classify_sim() {
     # Clean finish — "Finished mdrun" in the GROMACS log is the primary signal.
     # confout.gro (or pattern.gro) is checked for the files column display only;
     # its absence does not prevent FINISHED (it may have been moved or renamed).
-    if [[ "$status" != "FAILED" && "$status" != "FINALIZED" && $fin_log -eq 1 ]]; then
+    if [[ "$status" != "FAILED" && $fin_log -eq 1 ]]; then
         status="FINISHED"
         [[ -n "$mdlog" ]] && perf_enc="$(parse_performance "$mdlog")"
     fi
@@ -757,7 +793,6 @@ files_column() {
 status_label() {
     case "$1" in
         FINISHED)    printf "${GREEN}FINISHED   ✔${RESET}"  ;;
-        FINALIZED)   printf "${GREEN}FINALIZED  ✔${RESET}"  ;;
         RUNNING)     printf "${CYAN}RUNNING    ▶${RESET}"   ;;
         FAILED)      printf "${RED}FAILED     ✖${RESET}"    ;;
         INCOMPLETE)  printf "${YELLOW}INCOMPLETE ⚠${RESET}" ;;
@@ -858,7 +893,7 @@ printf "${BOLD}  %-${CW_PATH}s  %-${CW_STAT}s  %-${CW_JOB}s  %-${CW_TIME}s  %-${
 SEP="  $(printf '%.0s─' $(seq 1 $CW_PATH))  $(printf '%.0s─' $(seq 1 $CW_STAT))  $(printf '%.0s─' $(seq 1 $CW_JOB))  $(printf '%.0s─' $(seq 1 $CW_TIME))  $(printf '%.0s─' $(seq 1 $CW_FRM))  $(printf '%.0s─' $(seq 1 $CW_DSK))  $(printf '%.0s─' $(seq 1 $CW_ATM))  $(printf '%.0s─' {1..36})"
 echo -e "${DIM}${SEP}${RESET}"
 
-declare -i total=0 n_fin=0 n_finalized=0 n_run=0 n_fail=0 n_inc=0 n_queued=0 n_other=0
+declare -i total=0 n_fin=0 n_run=0 n_fail=0 n_inc=0 n_queued=0 n_other=0
 declare -a FAILED_DETAILS=()
 
 for sim_dir in "${SIM_DIRS[@]}"; do
@@ -875,7 +910,6 @@ for sim_dir in "${SIM_DIRS[@]}"; do
     total+=1
     case "$status" in
         FINISHED)    n_fin+=1       ;;
-        FINALIZED)   n_finalized+=1 ;;
         RUNNING)     n_run+=1       ;;
         FAILED)      n_fail+=1      ;;
         INCOMPLETE)  n_inc+=1       ;;
@@ -883,7 +917,7 @@ for sim_dir in "${SIM_DIRS[@]}"; do
         *)           n_other+=1     ;;
     esac
 
-    [[ $ERRORS_ONLY -eq 1 && "$status" != "FAILED" && "$status" != "FINALIZED" && "$status" != "INCOMPLETE" && "$status" != "QUEUED" ]] && continue
+    [[ $ERRORS_ONLY -eq 1 && "$status" != "FAILED" && "$status" != "INCOMPLETE" && "$status" != "QUEUED" ]] && continue
 
     disp_rel="$rel"
     (( ${#disp_rel} > CW_PATH )) && disp_rel="...${disp_rel: -$((CW_PATH-3))}"
@@ -919,12 +953,12 @@ for sim_dir in "${SIM_DIRS[@]}"; do
         fi
     fi
 
-    # ── Sub-rows: post-processing notes (FINALIZED) ───────────────────────────
-    if [[ "$status" == "FINALIZED" && "$gen_err" != "-" ]]; then
+    # ── Sub-rows: post-processing notes (FINISHED with script errors) ──────────
+    if [[ "$status" == "FINISHED" && "$gen_err" != "-" && "$gmx_enc" == "-" && "$mpi_enc" == "-" ]]; then
         print_block "$gen_err" "$DIM" "NOTE   " "└"
     fi
 
-    # ── Sub-rows: performance (FINISHED) ─────────────────────────────────────
+    # ── Sub-rows: performance (FINISHED and FINALIZED) ────────────────────────
     if [[ "$status" == "FINISHED" && "$perf_enc" != "-" ]]; then
         print_block "$perf_enc" "$GREEN" "PERF  " "└"
     fi
@@ -949,10 +983,11 @@ echo
 echo -e "${BOLD}  ┌─ SUMMARY ────────────────────────────────────────┐${RESET}"
 printf  "  │  %-30s  %5d                │\n" "Total simulation dirs:"  "$total"
 printf  "  │  %-30s  " "Finished:";   printf "${GREEN}%5d${RESET}                │\n" "$n_fin"
-printf  "  │  %-30s  " "Running:";    printf "${CYAN}%5d${RESET}                │\n"  "$n_run"
-printf  "  │  %-30s  " "Incomplete:"; printf "${YELLOW}%5d${RESET}                │\n" "$n_inc"
-printf  "  │  %-30s  " "Failed:";     printf "${RED}%5d${RESET}                │\n"   "$n_fail"
-printf  "  │  %-30s  %5d                │\n" "Other / Unknown:"        "$n_other"
+  printf  "  │  %-30s  " "Running:";    printf "${CYAN}%5d${RESET}                │\n"  "$n_run"
+  printf  "  │  %-30s  " "Queued:";     printf "${BLUE}%5d${RESET}                │\n"  "$n_queued"
+  printf  "  │  %-30s  " "Incomplete:"; printf "${YELLOW}%5d${RESET}                │\n" "$n_inc"
+  printf  "  │  %-30s  " "Failed:";     printf "${RED}%5d${RESET}                │\n"   "$n_fail"
+  printf  "  │  %-30s  %5d                │\n" "Other / Unknown:"        "$n_other"
 echo -e "${BOLD}  └──────────────────────────────────────────────────┘${RESET}"
 
 # ── Legend ────────────────────────────────────────────────────────────────────
