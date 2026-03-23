@@ -10,7 +10,7 @@ A terminal-based status explorer for GROMACS molecular dynamics simulations mana
 - **SLURM-authoritative status** — calls `squeue` once at startup. Two matching strategies:
   - *Exact*: job ID from `.err` file found in squeue (running/just-started jobs).
   - *Name-based*: replica + system numbers extracted from the directory path and matched against squeue job names — catches **pending (PD) jobs** that have no `.err` file yet.
-- **FINALIZED vs FAILED** — if `"Finished mdrun"` is present in the log but only post-processing script errors occurred (`sed`, `sbatch`), the status is `FINALIZED` instead of `FAILED`. The post-processing notes appear as dim sub-rows.
+- **Smart completion detection** — if `"Finished mdrun"` is in the log, the simulation is `FINISHED` regardless of post-processing script errors (`sed`, `sbatch`). Those errors appear as dim `NOTE` sub-rows without affecting the status.
 - **Three-layer inline error display** — GROMACS fatal block (`.out`), MPI/prterun messages (`.err`), and generic SLURM errors shown directly under each failed row.
 - **Timestep-aware time** — step counts × `dt` auto-scaled to ps / ns / µs.
 - **ANSI-aware column alignment** — all columns stay aligned even when coloured status strings contain invisible escape bytes.
@@ -82,7 +82,7 @@ The pattern (e.g. `9.production`) tells the script which files to read in each r
 | `-p, --pattern NAME` | *(interactive)* | Base name of GROMACS output files, e.g. `9.production` |
 | `--slurm-prefix PFX` | `MD_SIMULATION` | Prefix of SLURM log files → `PFX.err.<jobid>` |
 | `-d, --depth N` | unlimited | Maximum directory search depth |
-| `-e, --errors-only` | off | Show only FAILED / FINALIZED / INCOMPLETE / QUEUED rows |
+| `-e, --errors-only` | off | Show only FAILED / INCOMPLETE / QUEUED rows |
 | `-v, --verbose` | off | Show file inventory below each row |
 | `-x, --exclude PATTERN` | *(none)* | Skip dirs whose path contains `PATTERN`. Repeatable. |
 | `--no-color` | off | Disable ANSI colours (clean for piping / `grep`) |
@@ -154,16 +154,13 @@ The pattern (e.g. `9.production`) tells the script which files to read in each r
 
 | Status | Colour | Condition |
 |---|---|---|
-| `FINISHED ✔` | Green | `"Finished mdrun"` in GROMACS log |
-| `FINALIZED ✔` | Green | `"Finished mdrun"` in log, but post-run script had errors (`sed`/`sbatch`) — MD itself completed |
+| `FINISHED ✔` | Green | `"Finished mdrun"` in GROMACS log (post-processing errors shown as `NOTE` sub-rows) |
 | `RUNNING ▶` | Cyan | Job is `R` in squeue, or `.cpt` modified within the last 60 min |
 | `QUEUED ⏳` | Blue | Job is `PD` (pending) in squeue |
 | `INCOMPLETE ⚠` | Yellow | `.cpt` or `.edr` found, no clean finish, no error |
 | `FAILED ✖` | Red | GROMACS fatal block or MPI abort found in SLURM logs |
 | `NOT_STARTED ○` | Dim | `.tpr` found but no output files yet |
 | `NO_TPR ✗` | Magenta | No `.tpr` found |
-
-> **FINALIZED vs FAILED**: if the simulation ran to completion (`"Finished mdrun"` in the log) but the post-processing step failed (missing script, empty `sbatch` job), the status is `FINALIZED` — not `FAILED`. Post-processing notes still appear as dim `NOTE` sub-rows for visibility.
 
 ### Inline sub-rows
 
@@ -177,16 +174,11 @@ The pattern (e.g. `9.production`) tells the script which files to read in each r
     └ OTHER    sbatch: error: Batch script is empty!
 ```
 
-**Under FINALIZED rows:**
+**Under FINISHED rows — with post-processing errors (NOTE) and performance (PERF):**
 ```
-  14.2/.../replica3  FINALIZED ✔   1625377   ...
+  14.2/.../replica3  FINISHED ✔   1625377   ...
     └ NOTE   sed: can't read 1.post-process.sh: No such file or directory
-```
-
-**Under FINISHED rows (performance):**
-```
-  14.1/.../replica1  FINISHED ✔   ...
-    └ PERF   ns/day: 2.345   hours/ns: 10.234   wall time: 34h12m07s
+    └ PERF   ns/day: 2265.464   hours/ns: 0.011   wall time: 66h44m07s
 ```
 
 **Under RUNNING / INCOMPLETE rows (last progress line):**
@@ -200,8 +192,8 @@ The pattern (e.g. `9.production`) tells the script which files to read in each r
 | `GROMACS` | Red | `-------` fatal block in GROMACS `.out` |
 | `MPI/PAR` | Orange | `MPI_ABORT`, `prterun`, segfault from `.err` |
 | `OTHER` | Yellow | `sbatch` errors, missing files, I/O |
-| `NOTE` | Dim | Post-processing errors on a completed simulation |
-| `PERF` | Green | Performance stats from GROMACS log (FINISHED only) |
+| `NOTE` | Dim | Post-processing script errors on a completed simulation (`sed`/`sbatch`) |
+| `PERF` | Green | `ns/day: X   hours/ns: Y   wall time: HHhMMmSSs` from GROMACS log |
 | `PROGRS` | Cyan | Last progress line from SLURM `.out` (RUNNING/INCOMPLETE) |
 
 ---
