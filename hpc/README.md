@@ -6,10 +6,13 @@ A terminal-based status explorer for GROMACS molecular dynamics simulations mana
 
 ## Features
 
-- **Fingerprint-based discovery** — no directory name assumptions. Finds simulation dirs by presence of `.tpr`, `.cpt`, `.edr`, `.xtc`, `.log` files at any depth.
+- **Three-path discovery** — no directory name assumptions:
+  - *Fingerprints*: `.tpr`, `.cpt`, `.edr`, `.xtc`, `.log` files at any depth.
+  - *SLURM logs*: `<prefix>.err.<jobid>` files — catches dirs where a job was submitted but GROMACS has not started yet.
+  - *squeue-guided*: for completely empty dirs, matches PD job names against directory names — finds jobs submitted before any file is created.
 - **SLURM-authoritative status** — calls `squeue` once at startup. Two matching strategies:
   - *Exact*: job ID from `.err` file found in squeue (running/just-started jobs).
-  - *Name-based*: replica + system numbers extracted from the directory path and matched against squeue job names — catches **pending (PD) jobs** that have no `.err` file yet.
+  - *Name-based*: replica number (`replicaN`, `repN`, `rep_N`) and system tokens extracted from the directory name, matched against squeue job names using score-based selection — catches **pending (PD) jobs** with no `.err` file yet.
 - **Smart completion detection** — if `"Finished mdrun"` is in the log, the simulation is `FINISHED` regardless of post-processing script errors (`sed`, `sbatch`). Those errors appear as dim `NOTE` sub-rows without affecting the status.
 - **Three-layer inline error display** — GROMACS fatal block (`.out`), MPI/prterun messages (`.err`), and generic SLURM errors shown directly under each failed row.
 - **Timestep-aware time** — step counts × `dt` auto-scaled to ps / ns / µs.
@@ -215,15 +218,22 @@ The log contains the full terminal output **plus** a `FAILED SIMULATIONS — FUL
 
 ## How SLURM State Works
 
-`squeue -u $USER` is called once at startup. For each simulation directory, two matching strategies are tried in order:
+`squeue -u $USER` is called once at startup and builds an in-memory table of `job_id → state` and `job_id → name`. For each simulation directory, two matching strategies are tried in order:
 
-1. **Exact** — `.err` files in the directory are scanned; if any job ID appears in the squeue table, that job's state is used directly. Works for running and recently started jobs.
+1. **Exact** — `.err` files in the directory are scanned from newest to oldest; if any job ID appears in the squeue table, that job's state is used directly. Works for running and recently started jobs.
 
-2. **Name-based** — for pending jobs (PD) that have no `.err` file yet, the replica number and system-specific number are extracted from the directory path and matched against squeue job names:
-   - Replica from `replicaN` in the path → job name must start with `r{N}_`
-   - System number from the protein name pattern (e.g. `CCPG1-2SIGMAR` → `2`) → job name must contain `-2`
+2. **Name-based (score-based)** — for pending jobs (PD) that have no `.err` file yet, the script extracts tokens from the directory name and scores all candidate squeue jobs:
+   - **Replica number**: supports `replicaN`, `repN`, `rep_N`, `rep-N` — job name must start with `r{N}_`
+   - **System number**: if the dir contains a `LETTER-N-LETTER` pattern (e.g. `CCPG1-2SIGMAR` → `2`), used as an exact discriminator
+   - **Token scoring**: alphanumeric segments ≥ 3 chars from the dir name are matched against job name tokens; the job with the most matching tokens wins
+   - **Cross-system exclusion**: if a job name contains a meaningful token absent from the dir name (e.g. `chol` in job but not in dir), it is rejected
 
-   Example: `14.2.oligomerization_CG_8CCPG1-2SIGMAR1/replica3` → matches `r3_ccpg1-idr-8_sigmar1-2_memb`.
+   Examples:
+   - `14.2.oligomerization_CG_8CCPG1-2SIGMAR1/replica3` → matches `r3_ccpg1-idr-8_sigmar1-2_memb`
+   - `4x_fam134b_rep2` → matches `r2_fl_fam134b_AA` (not `r2_fl_fam134b-5chol_AA`, which is rejected because `chol` is absent from the dir name)
+   - `4x_fam134b-5chol_rep2` → matches `r2_fl_fam134b-5chol_AA` (scores 2 tokens: `fam134b` + `chol`)
+
+3. **squeue-guided discovery** — after normal file-based discovery, the script scans squeue PD jobs and tries to find matching directories that have no files at all yet (job submitted before `gmx grompp` ran). Uses the same token-scoring logic.
 
 If `squeue` is unavailable, the script falls back entirely to file-based heuristics (checkpoint modification time, presence of output files).
 

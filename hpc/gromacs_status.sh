@@ -209,10 +209,12 @@ if command -v squeue &>/dev/null; then
 fi
 
 # match_dir_to_squeue DIR RELPATH
-# Returns "JOB_ID STATE" if a squeue job can be matched to this directory.
-# Strategy 1 (exact): scan .err files — if any job_id is in squeue, use it.
-# Strategy 2 (name):  extract replica number and system number from dir path,
-#                     match against squeue job names — catches PD jobs (no .err yet).
+# Returns "JOB_ID STATE" if a squeue job matches this directory.
+# Strategy 1 (exact): any .err file job_id found in squeue.
+# Strategy 2 (name):  multi-signal match against squeue job names —
+#   supports replicaN, rep_N, repN, rep-N replica suffixes;
+#   uses sys_num (CCPG1-2SIGMAR style), token overlap, and cross-system
+#   exclusion (job has tokens absent from dir → different system).
 match_dir_to_squeue() {
     local dir="$1" dirpath="$2"
 
@@ -229,34 +231,69 @@ match_dir_to_squeue() {
         | grep -iE "\.err\.[0-9]+$" \
         | awk -F. '{print $NF"\t"$0}' | sort -k1,1rn | cut -f2-)
 
-    # ── Strategy 2: name-based match for PD jobs (no .err file yet) ───────────
-    # Extract replica number from the last path component (replicaN)
+    # ── Strategy 2: name-based match ──────────────────────────────────────────
+    # Extract replica number — support replicaN, rep_N, repN, rep-N
     local rep_num
-    rep_num=$(echo "$dirpath" | grep -oP "(?i)replica\K\d+")
+    rep_num=$(echo "$dirpath" | grep -oP "(?i)rep(?:lica)?[-_]?\K\d+" | tail -1)
     [[ -z "$rep_num" ]] && return
 
-    # Extract system-specific number: the digit(s) between a letter-dash and a letter
-    # e.g. CCPG1-2SIGMAR → 2   CCPG1-10SIGMAR → 10
-    local sys_dir sys_num
-    sys_dir=$(echo "$dirpath" | grep -oP "[^/]+(?=/[Rr]eplica)" | tail -1)
-    # Matches patterns like CCPG1-2SIGMAR (letter+digits-NUMBER+letter)
-    sys_num=$(echo "$sys_dir" | grep -oP "[A-Z][0-9]*-\K[0-9]+(?=[A-Z])" | head -1)
-    [[ -z "$sys_num" ]] && return
+    # System dir: last path component with rep suffix stripped
+    local sys_dir
+    sys_dir=$(echo "$dirpath" | grep -oP "[^/]+" | tail -1 \
+        | sed 's/[-_]\?[Rr]ep\([Ll]ica\)\?[-_]\?[0-9].*$//' \
+        | sed 's/[-_]$//')
+    [[ -z "$sys_dir" ]] && sys_dir=$(echo "$dirpath" | grep -oP "[^/]+" | tail -2 | head -1)
 
+    # System number: letter+digits-NUMBER+letter pattern (e.g. CCPG1-2SIGMAR → 2)
+    local sys_num
+    sys_num=$(echo "$sys_dir" | grep -oP "[A-Z][0-9]*-\K[0-9]+(?=[A-Z])" | head -1)
+
+    # Tokens: use alphanumeric segments (≥3 chars) to handle names like "fam134b"
+    local dir_tokens
+    dir_tokens=$(echo "$sys_dir" | tr '[:upper:]' '[:lower:]'         | grep -oP "[A-Za-z0-9]{3,}" | grep -v "^[0-9]*$" | tr '\n' '|')
+
+    # Score-based selection: iterate all candidates, pick the best match.
+    # Score = number of dir tokens found in job name. This ensures
+    # "fam134b-5chol" prefers a job with both "fam134b" AND "chol".
+    local best_jid="" best_state="" best_score=0
+    local noise="general|memb|prod|step|charmm|gromacs|amber|opls"
     local jid jname jstate
+
     for jid in "${!SLURM_JOBS[@]}"; do
         jstate="${SLURM_JOBS[$jid]}"
-        jname="${SLURM_NAMES[$jid],,}"   # lowercase
+        jname="${SLURM_NAMES[$jid],,}"
 
-        # Must start with r{replica}_  or  r{replica}-
+        # Replica: job must start with r{N}_ or r{N}-
         [[ "$jname" == "r${rep_num}_"* || "$jname" == "r${rep_num}-"* ]] || continue
 
-        # Must contain the system number as -N followed by non-digit or end
-        echo "$jname" | grep -qP "[-_]${sys_num}([-_]|$)" || continue
+        # System number: exact match is strongest — return immediately
+        if [[ -n "$sys_num" ]]; then
+            echo "$jname" | grep -qP "[-_]${sys_num}([-_]|$)" && { echo "$jid $jstate"; return; }
+        fi
 
-        echo "$jid $jstate"
-        return
+        # Cross-check: reject if job has a meaningful token absent from dir
+        local skip=0
+        while IFS= read -r jt; do
+            [[ ${#jt} -lt 3 ]] && continue
+            echo "$noise" | grep -q "$jt" && continue
+            echo "$dir_tokens" | grep -q "$jt" || { skip=1; break; }
+        done < <(echo "$jname" | grep -oP "[a-z0-9]{3,}" | grep -v "^[0-9]*$")
+        [[ $skip -eq 1 ]] && continue
+
+        # Score: count dir tokens that appear in job name
+        local score=0
+        while IFS= read -r dt; do
+            [[ ${#dt} -lt 3 ]] && continue
+            echo "$jname" | grep -q "$dt" && (( score++ ))
+        done < <(echo "$sys_dir" | tr '[:upper:]' '[:lower:]' \
+            | grep -oP "[A-Za-z0-9]{3,}" | grep -v "^[0-9]*$")
+
+        if (( score > best_score )); then
+            best_score=$score; best_jid=$jid; best_state=$jstate
+        fi
     done
+
+    [[ -n "$best_jid" && $best_score -gt 0 ]] && echo "$best_jid $best_state"
 }
 
 # ── Find depth ────────────────────────────────────────────────────────────────
@@ -275,10 +312,17 @@ fi
 # ── Discovery ─────────────────────────────────────────────────────────────────
 discover_sim_dirs() {
     local tmp; tmp=$(mktemp)
+    # Primary: GROMACS fingerprint files
     for pattern in "${FINGERPRINTS[@]}"; do
         find "$ROOT_DIR" "${depth_args[@]}" -name "$pattern" -print0 2>/dev/null \
             | xargs -0 -I{} dirname "{}" >> "$tmp" 2>/dev/null || true
     done
+    # Secondary: SLURM log files (*.err.<digits> / *.out.<digits>) —
+    # catches dirs where a job was submitted but GROMACS hasn't created
+    # output files yet (e.g. grompp runs inside the job script).
+    find "$ROOT_DIR" "${depth_args[@]}" -type f 2>/dev/null \
+        | grep -iE "(/${SLURM_PREFIX}\.[Ee][Rr][Rr]\.[0-9]+|/${SLURM_PREFIX}\.[Oo][Uu][Tt]\.[0-9]+)$" \
+        | xargs -I{} dirname "{}" >> "$tmp" 2>/dev/null || true
 
     # Resolve log dir for exact exclusion
     local logdir_real; logdir_real=$(realpath "$LOG_DIR" 2>/dev/null || echo "$LOG_DIR")
@@ -303,8 +347,8 @@ discover_sim_dirs() {
         [[ $_skip -eq 1 ]] && continue
 
         # Require the directory to contain at least one unambiguous GROMACS file
-        # (*.tpr, *.edr, *.xtc, *.trr, *.cpt, or confout.gro).
-        # This prevents bare log-only dirs (like the status log dir) from matching.
+        # (*.tpr, *.edr, *.xtc, *.trr, *.cpt, confout.gro) OR a SLURM log file
+        # matching the configured prefix (job submitted but not yet started).
         local is_sim=0
         for ext in tpr edr xtc trr cpt; do
             if [[ -n "$(find "$d" -maxdepth 1 -name "*.${ext}" 2>/dev/null | head -1)" ]]; then
@@ -312,6 +356,10 @@ discover_sim_dirs() {
             fi
         done
         [[ -f "$d/confout.gro" ]] && is_sim=1
+        # Accept dirs with a SLURM log — job submitted, files not yet created
+        if [[ $is_sim -eq 0 ]]; then
+            [[ -n "$(find "$d" -maxdepth 1 -type f                 -name "${SLURM_PREFIX}.err.*" -o                 -name "${SLURM_PREFIX}.out.*" 2>/dev/null | head -1)" ]] && is_sim=1
+        fi
         [[ $is_sim -eq 0 ]] && continue
 
         echo "$d"
@@ -598,6 +646,9 @@ classify_sim() {
     #   2. ${SIM_PATTERN}.gro   (when mdrun -c is set to the pattern)
     #   3. ${SIM_PATTERN}*.gro  (any variant suffix, e.g. _final.gro)
     #   4. any *.gro newer than the .tpr (produced by this run, not input)
+    # Final coordinate file — pattern-specific search only.
+    # The -newer $tpr wildcard fallback is applied LATER, only when fin_log=1,
+    # to avoid matching equilibration/input .gro files in running simulations.
     confout=""
     confout=$(find "$dir" -maxdepth 1 -name "confout.gro" 2>/dev/null | head -1)
     if [[ -z "$confout" && -n "$SIM_PATTERN" ]]; then
@@ -605,10 +656,6 @@ classify_sim() {
     fi
     if [[ -z "$confout" && -n "$SIM_PATTERN" ]]; then
         confout=$(find "$dir" -maxdepth 1 -name "${SIM_PATTERN}*.gro" 2>/dev/null | head -1)
-    fi
-    if [[ -z "$confout" && -n "$tpr" ]]; then
-        # Last resort: any .gro file newer than the .tpr (output, not input)
-        confout=$(find "$dir" -maxdepth 1 -name "*.gro" -newer "$tpr" 2>/dev/null | head -1)
     fi
     err_file=$(latest_slurm_file "$dir" "err")
     out_file=$(latest_slurm_file "$dir" "out")
@@ -641,6 +688,12 @@ classify_sim() {
     [[ $SHOW_DISK -eq 1 ]] && disk="$(dir_disk_usage "$dir")"
     # Detect clean mdrun finish early — used by both FINISHED and FINALIZED
     [[ -n "$mdlog" ]] && grep -q "Finished mdrun" "$mdlog" 2>/dev/null && fin_log=1
+    # Only now apply the wildcard -newer fallback — gated on fin_log=1 so we
+    # don't pick up equilibration/input .gro files in still-running simulations.
+    if [[ $fin_log -eq 1 && -z "$confout" && -n "$tpr" ]]; then
+        confout=$(find "$dir" -maxdepth 1 -name "*.gro" -newer "$tpr" 2>/dev/null | head -1)
+        [[ -n "$confout" ]] && has_confout=1
+    fi
     # If mdrun finished cleanly it always wrote a final structure — mark gro:●
     # even if we could not determine the exact filename from disk.
     [[ $fin_log -eq 1 ]] && has_confout=1
@@ -853,6 +906,63 @@ echo -e "  ${DIM}Scanning fingerprints: ${FINGERPRINTS[*]}${RESET}"
 echo
 
 mapfile -t SIM_DIRS < <(discover_sim_dirs)
+
+# ── squeue-guided discovery ────────────────────────────────────────────────────
+# For PD jobs that haven't created any files yet (no .tpr, no SLURM logs),
+# try to find their directory by matching the job name against subdir names.
+if [[ $SLURM_AVAILABLE -eq 1 ]]; then
+    declare -A _discovered=()
+    for _d in "${SIM_DIRS[@]}"; do _discovered["$_d"]=1; done
+
+    for _jid in "${!SLURM_JOBS[@]}"; do
+        [[ "${SLURM_JOBS[$_jid]}" != "PD" && "${SLURM_JOBS[$_jid]}" != "PENDING" ]] && continue
+        _jname="${SLURM_NAMES[$_jid],,}"
+
+        # Extract replica number from job name (r{N}_ prefix)
+        _jrep=$(echo "$_jname" | grep -oP "^r\K\d+(?=[_-])")
+        [[ -z "$_jrep" ]] && continue
+
+        # Search all direct subdirs of ROOT_DIR for a name match
+        while IFS= read -r -d '' _subdir; do
+            [[ -n "${_discovered[$_subdir]+x}" ]] && continue  # already found
+
+            _bname=$(basename "$_subdir")
+            _bname_lower="${_bname,,}"
+
+            # Replica check: dir must contain rep{N} or replica{N}
+            _drep=$(echo "$_bname" | grep -oP "(?i)rep(?:lica)?[-_]?\K\d+" | tail -1)
+            [[ "$_drep" != "$_jrep" ]] && continue
+
+            # Token check: extract alphanumeric segments (3+ chars) from both names.
+            # Handles names like "fam134b" that have no pure-alpha 4-char words.
+            local_match=0
+            while IFS= read -r _tok; do
+                [[ ${#_tok} -lt 3 ]] && continue
+                echo "$_jname" | grep -qi "$_tok" && { local_match=1; break; }
+            done < <(echo "$_bname_lower" | grep -oP "[A-Za-z0-9]{3,}")
+            # If no tokens matched and dir has no meaningful tokens → replica alone ok
+            if [[ $local_match -eq 0 ]]; then
+                _dtc=$(echo "$_bname_lower" | grep -oP "[A-Za-z0-9]{4,}"                     | grep -cv "^rep" 2>/dev/null || echo 0)
+                [[ "$_dtc" -eq 0 ]] && local_match=1
+            fi
+            [[ $local_match -eq 0 ]] && continue
+
+            # Cross-check: no significant job token absent from dir name
+            _skip=0
+            while IFS= read -r _jtok; do
+                [[ ${#_jtok} -lt 3 ]] && continue
+                echo "general memb prod step charmm gromacs amber" | grep -qi "$_jtok" && continue
+                echo "$_bname_lower" | grep -qi "$_jtok" || { _skip=1; break; }
+            done < <(echo "$_jname" | grep -oP "[a-z0-9]{3,}")
+            [[ $_skip -eq 1 ]] && continue
+
+            # Match found — add to SIM_DIRS
+            SIM_DIRS+=("$_subdir")
+            _discovered["$_subdir"]=1
+        done < <(find "$ROOT_DIR" "${depth_args[@]}" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null)
+    done
+    unset _discovered _jid _jname _jrep _subdir _bname _bname_lower _drep _tok _jtok _skip local_match
+fi
 
 if [[ ${#SIM_DIRS[@]} -eq 0 ]]; then
     echo -e "${YELLOW}  No GROMACS simulation directories found under '${ROOT_DIR}'.${RESET}"
